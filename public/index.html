@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Warlocks</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0b12; overflow: hidden; font-family: system-ui, sans-serif; }
+  canvas { display: block; cursor: crosshair; }
+  #hud {
+    position: fixed; top: 10px; left: 10px; color: #ddd; font-size: 14px;
+    background: rgba(0,0,0,.45); padding: 8px 12px; border-radius: 8px; pointer-events: none;
+  }
+  #status {
+    position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
+    color: #fff; font-size: 22px; font-weight: 600; text-shadow: 0 2px 6px #000; pointer-events: none;
+  }
+  #tuning {
+    position: fixed; top: 10px; right: 10px; width: 230px; display: none;
+    background: rgba(0,0,0,.65); color: #ddd; font-size: 12px;
+    padding: 10px 14px 14px; border-radius: 8px;
+  }
+  #tuning label { display: block; margin-top: 8px; }
+  #tuning span { color: #ffd54f; float: right; }
+  #tuning input { width: 100%; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">WASD move &middot; click to cast fireball &middot; space to dash &middot; T for tuning</div>
+<div id="status"></div>
+<div id="tuning"></div>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+
+let myId = null;
+let world = 1600, center = { x: 800, y: 800 }, playerR = 16, fireballR = 9;
+let pillars = [];
+
+// snapshot buffer for interpolation (render ~70ms in the past)
+const INTERP_DELAY = 70;
+const snaps = [];
+let clockOffset = 0; // serverTime - clientTime
+
+const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+const ws = new WebSocket(`${proto}://${location.host}`);
+
+ws.onmessage = (e) => {
+  const msg = JSON.parse(e.data);
+  if (msg.t === 'welcome') {
+    myId = msg.id;
+    world = msg.world; center = msg.center;
+    playerR = msg.playerR; fireballR = msg.fireballR;
+    pillars = msg.pillars || [];
+    applyTuning(msg.tuning);
+  } else if (msg.t === 's') {
+    msg.recv = performance.now();
+    // smooth the offset so network jitter doesn't wobble the interpolation clock
+    const sample = msg.now - Date.now();
+    clockOffset = clockOffset === 0 ? sample : clockOffset * 0.95 + sample * 0.05;
+    snaps.push(msg);
+    if (snaps.length > 30) snaps.shift();
+    const me = msg.players.find(p => p.id === myId);
+    if (me && me.a) reconcile(me);
+    // server confirmed one of our casts: pair the oldest ghost with it for blending
+    const liveIds = new Set();
+    for (const f of msg.fireballs) {
+      liveIds.add(f.id);
+      if (f.o === myId && !seenMyFireballs.has(f.id)) {
+        seenMyFireballs.add(f.id);
+        const g = ghosts.shift();
+        if (g) ghostById.set(f.id, g);
+      }
+    }
+    for (const h of (msg.hits || [])) {
+      hitIds.add(h.fid);
+      const role = h.o === myId ? 'shoot' : (h.v === myId ? 'self' : 'spec');
+      const m = { fid: h.fid, role, procAt: performance.now(), contactAt: null, boomAt: null, knockAt: null };
+      if (role === 'shoot') {
+        // own ball renders in real time along the ghost trajectory
+        const g = ghostById.get(h.fid) || ghosts[0];
+        if (g) m.contactAt = g.at + Math.hypot(h.x - g.x, h.y - g.y) / FIREBALL_SPEED * 1000;
+      } else {
+        // other balls render on the interp timeline: they cross the impact
+        // point exactly when the render clock reaches the hit time
+        const renderNow = Date.now() + clockOffset - INTERP_DELAY;
+        m.contactAt = performance.now() + (msg.now - renderNow);
+      }
+      pendingMeasures.push(m);
+      if (pendingMeasures.length > 40) pendingMeasures.shift();
+      if (h.o === myId && !seenMyFireballs.has(h.fid)) { seenMyFireballs.add(h.fid); ghosts.shift(); }
+      if (role !== 'spec') {
+        // this fireball (or the victim: us) lives on the real-time timeline,
+        // so react the moment the server tells us instead of waiting for interp
+        ghostById.delete(h.fid);
+        explosions.push({ x: h.x, y: h.y, at: performance.now() });
+        m.boomAt = performance.now();
+        m.knockAt = role === 'shoot' ? m.boomAt
+          : (performance.now() - lastJoltAt < 150 ? lastJoltAt : null);
+        if (h.v !== myId) {
+          knocks.push({ v: h.v, kvx: h.dx * h.kb, kvy: h.dy * h.kb, hitTime: msg.now, visStart: performance.now() });
+        }
+      } else {
+        // spectated hit: both ball and victim are on the interp timeline,
+        // so detonate exactly when the render clock reaches the hit
+        scheduledHits.push({ fid: h.fid, x: h.x, y: h.y, dx: h.dx, dy: h.dy, hitTime: msg.now });
+      }
+    }
+    // a fireball that vanished between snapshots hit something (or fizzled)
+    for (const f of prevFireballs) {
+      if (liveIds.has(f.id)) continue;
+      if (hitIds.delete(f.id)) continue; // already handled via hit event
+      let ex = f.x, ey = f.y;
+      const g = ghostById.get(f.id);
+      if (g) {
+        const dt = (performance.now() - g.at) / 1000;
+        ex = g.x + g.dx * FIREBALL_SPEED * dt;
+        ey = g.y + g.dy * FIREBALL_SPEED * dt;
+      }
+      explosions.push({ x: ex, y: ey, at: performance.now() });
+    }
+    prevFireballs = msg.fireballs;
+    for (const id of ghostById.keys()) if (!liveIds.has(id)) ghostById.delete(id);
+    for (const id of seenMyFireballs) if (!liveIds.has(id)) seenMyFireballs.delete(id);
+  }
+  else if (msg.t === 'tuning') applyTuning(msg.tuning);
+  else if (msg.t === 'pong') {
+    const sample = performance.now() - msg.c;
+    rtt = rtt ? rtt * 0.8 + sample * 0.2 : sample;
+  }
+};
+ws.onclose = () => { statusEl.textContent = 'Disconnected from server'; };
+
+// --- input ---
+const keys = { up: false, down: false, left: false, right: false };
+const keymap = { w: 'up', s: 'down', a: 'left', d: 'right',
+                 ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right' };
+let dashQueued = false;
+addEventListener('keydown', (e) => {
+  if (e.key === ' ') { dashQueued = true; e.preventDefault(); return; }
+  const k = keymap[e.key]; if (k) keys[k] = true;
+});
+addEventListener('keyup', (e) => { const k = keymap[e.key]; if (k) keys[k] = false; });
+// keyup events are lost when the tab loses focus, so release everything
+function releaseKeys() {
+  for (const k in keys) keys[k] = false;
+  dashQueued = false;
+}
+addEventListener('blur', releaseKeys);
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseKeys(); });
+
+// --- client-side prediction ---
+// Physics values: must match server.js exactly; live-updated via tuning sync
+const TICK_RATE = 30, DT = 1 / TICK_RATE;
+let MOVE_SPEED = 190, FRICTION = 3.2;
+let PILLAR_BOUNCE = 0.3, PILLAR_SLIDE = 0.15;
+let DASH_SPEED = 700, DASH_COOLDOWN = 0, CAST_COOLDOWN = 0.6;
+let FIREBALL_SPEED = 420;
+
+const TUNABLES = [
+  ['moveSpeed', 'Move speed', 50, 500, 5],
+  ['friction', 'Friction', 0.5, 10, 0.1],
+  ['dashSpeed', 'Dash speed', 0, 1500, 10],
+  ['dashCooldown', 'Dash cooldown (s)', 0, 10, 0.1],
+  ['castCooldown', 'Cast cooldown (s)', 0.05, 3, 0.05],
+  ['fireballSpeed', 'Fireball speed', 100, 1200, 10],
+  ['fireballDmg', 'Fireball damage', 0, 50, 1],
+  ['kbBase', 'Knockback base', 0, 800, 10],
+  ['kbPerDmg', 'Knockback per dmg', 0, 20, 0.5],
+  ['pillarBounce', 'Pillar bounce', 0, 1, 0.05],
+  ['pillarSlide', 'Pillar slide', 0, 1, 0.05]
+];
+function applyTuning(t) {
+  if (!t) return;
+  MOVE_SPEED = t.moveSpeed; FRICTION = t.friction;
+  DASH_SPEED = t.dashSpeed; DASH_COOLDOWN = t.dashCooldown;
+  CAST_COOLDOWN = t.castCooldown; FIREBALL_SPEED = t.fireballSpeed;
+  PILLAR_BOUNCE = t.pillarBounce; PILLAR_SLIDE = t.pillarSlide;
+  for (const [key] of TUNABLES) {
+    const r = document.getElementById('tr-' + key);
+    if (!r) continue;
+    if (document.activeElement !== r) r.value = t[key];
+    document.getElementById('tv-' + key).textContent = t[key];
+  }
+}
+const tuningEl = document.getElementById('tuning');
+for (const [key, label, min, max, step] of TUNABLES) {
+  const l = document.createElement('label');
+  l.innerHTML = `${label}: <span id="tv-${key}"></span>`;
+  const r = document.createElement('input');
+  r.type = 'range'; r.min = min; r.max = max; r.step = step; r.id = 'tr-' + key;
+  r.addEventListener('input', () => {
+    document.getElementById('tv-' + key).textContent = r.value;
+    if (ws.readyState === 1) ws.send(JSON.stringify({ t: 'tune', key, value: Number(r.value) }));
+  });
+  tuningEl.append(l, r);
+}
+addEventListener('keydown', (e) => {
+  if (e.key === 't' || e.key === 'T') {
+    tuningEl.style.display = tuningEl.style.display === 'block' ? 'none' : 'block';
+  }
+});
+
+function stepPlayer(p, k, dt) {
+  let mx = 0, my = 0;
+  if (k.up) my -= 1;
+  if (k.down) my += 1;
+  if (k.left) mx -= 1;
+  if (k.right) mx += 1;
+  const len = Math.hypot(mx, my);
+  if (len > 0) { mx /= len; my /= len; }
+  p.dashCd = Math.max(0, (p.dashCd || 0) - dt);
+  if (k.dash && p.dashCd === 0 && len > 0) {
+    p.vx += mx * DASH_SPEED;
+    p.vy += my * DASH_SPEED;
+    p.dashCd = DASH_COOLDOWN;
+  }
+  p.x += (mx * MOVE_SPEED + p.vx) * dt;
+  p.y += (my * MOVE_SPEED + p.vy) * dt;
+  const decay = Math.exp(-FRICTION * dt);
+  p.vx *= decay; p.vy *= decay;
+  // must match server.js exactly: axis pushout + reflected bounce
+  for (const pl of pillars) {
+    const e = pl.half + playerR;
+    const dx = p.x - pl.x, dy = p.y - pl.y;
+    if (Math.abs(dx) < e && Math.abs(dy) < e) {
+      const ox = e - Math.abs(dx), oy = e - Math.abs(dy);
+      if (ox <= oy) {
+        p.x = pl.x + (dx < 0 ? -e : e);
+        p.vx = -p.vx * PILLAR_BOUNCE;
+        p.vy *= PILLAR_SLIDE;
+      } else {
+        p.y = pl.y + (dy < 0 ? -e : e);
+        p.vy = -p.vy * PILLAR_BOUNCE;
+        p.vx *= PILLAR_SLIDE;
+      }
+    }
+  }
+  p.x = Math.min(world - playerR, Math.max(playerR, p.x));
+  p.y = Math.min(world - playerR, Math.max(playerR, p.y));
+}
+
+let seq = 0;
+let pending = [];                       // inputs the server hasn't acked yet
+let predicted = null;                   // { x, y, vx, vy } for my player
+let predictedPrev = null;               // predicted pos before the latest step, for render lerp
+let lastStepAt = 0;
+let errX = 0, errY = 0;                 // smoothed visual correction offset
+const SNAP_DIST = 120;                  // beyond this, teleport (respawn etc.)
+const IMPULSE_VEL = 120;                // velocity jump that means "knockback, don't smooth"
+
+setInterval(() => {
+  if (ws.readyState !== 1 || myId === null) return;
+  const me = latestPlayer(myId);
+  if (!me || !me.a) { predicted = null; predictedPrev = null; pending = []; return; }
+  if (!predicted) predicted = { x: me.x, y: me.y, vx: me.vx || 0, vy: me.vy || 0, dashCd: me.dcd || 0 };
+
+  seq++;
+  const k = { ...keys, dash: dashQueued };
+  dashQueued = false;
+  ws.send(JSON.stringify({ t: 'input', seq, keys: k }));
+  pending.push({ seq, keys: k });
+  if (pending.length > 90) pending.shift();
+  predictedPrev = { x: predicted.x, y: predicted.y };
+  stepPlayer(predicted, k, DT);
+  lastStepAt = performance.now();
+}, 1000 / TICK_RATE);
+
+// reconcile against an authoritative snapshot of my player
+function reconcile(me) {
+  if (!predicted || me.seq === undefined) return;
+  pending = pending.filter(i => i.seq > me.seq);
+  const auth = { x: me.x, y: me.y, vx: me.vx || 0, vy: me.vy || 0, dashCd: me.dcd || 0 };
+  for (const i of pending) stepPlayer(auth, i.keys, DT);
+  const dx = predicted.x - auth.x, dy = predicted.y - auth.y;
+  const dv = Math.hypot(predicted.vx - auth.vx, predicted.vy - auth.vy);
+  if (Math.hypot(dx, dy) > SNAP_DIST) {
+    errX = 0; errY = 0;                 // hard snap
+    // respawn teleports also land here; only mid-round snaps are anomalies
+    const s = snaps[snaps.length - 1];
+    if (s && s.round.state === 'playing') hardSnaps++;
+  } else if (dv < IMPULSE_VEL) {
+    errX += dx; errY += dy;             // fold difference into visual error
+  } else {
+    // a knockback landed — let the jolt through unsmoothed
+    jolts++; lastJoltAt = performance.now();
+  }
+  if (predictedPrev) { predictedPrev.x -= dx; predictedPrev.y -= dy; }
+  predicted = auth;
+}
+
+let view = { scale: 1, ox: 0, oy: 0 };
+const VIEW_WORLD = 900;          // world units visible across the shorter screen axis
+let cam = null;                  // smoothed camera center in world coords
+let castCdEnd = 0; // local prediction of fireball cooldown for the HUD
+let ghosts = [];   // locally predicted fireballs awaiting server confirmation
+const seenMyFireballs = new Set();
+const ghostById = new Map(); // confirmed fireball id -> its client-predicted trajectory
+let explosions = [];
+let prevFireballs = [];
+let lastFrameAt = performance.now();
+const hitIds = new Set();  // fireballs already detonated via a hit event
+let scheduledHits = [];    // hits waiting for the render clock to reach them
+let knocks = [];           // early visual knockback on remote victims
+
+// --- diagnostics: compact, machine-readable; server exposes them at GET /diag ---
+// Per hit we measure the gap (ms) between the rendered fireball crossing the
+// impact point (computed from its known straight-line render timeline) and the
+// explosion ("boom") / knockback ("knock") rendering. Negative = effect before
+// the ball visually arrives, ~0 ideal.
+let rtt = 0, fpsEma = 60, maxErrMag = 0;
+let hardSnaps = 0, jolts = 0, lastJoltAt = 0, noContact = 0, noKnock = 0;
+let pendingMeasures = [];  // in-flight per-hit measurements
+const hitSamples = { shoot: [], self: [], spec: [] }; // rolling windows by perspective
+
+setInterval(() => {
+  if (ws.readyState === 1) ws.send(JSON.stringify({ t: 'ping', c: performance.now() }));
+}, 2000);
+setInterval(() => {
+  if (ws.readyState !== 1) return;
+  const agg = (vals) => {
+    if (!vals.length) return null;
+    const s = [...vals].sort((x, y) => x - y);
+    return { p50: s[Math.floor(s.length / 2)], worst: s.reduce((w, v) => Math.abs(v) > Math.abs(w) ? v : w, 0) };
+  };
+  const hits = {};
+  for (const r in hitSamples) {
+    if (!hitSamples[r].length) continue;
+    hits[r] = {
+      n: hitSamples[r].length,
+      boom: agg(hitSamples[r].map(s => s.boom).filter(v => v !== null)),
+      knock: agg(hitSamples[r].map(s => s.knock).filter(v => v !== null))
+    };
+  }
+  ws.send(JSON.stringify({ t: 'diag', d: {
+    rtt: Math.round(rtt), fps: Math.round(fpsEma), maxErr: Math.round(maxErrMag),
+    hardSnaps, jolts, noContact, noKnock, hits
+  }}));
+  maxErrMag = 0;
+}, 5000);
+canvas.addEventListener('mousedown', (e) => {
+  if (ws.readyState !== 1 || myId === null) return;
+  const me = predicted || latestPlayer(myId);
+  if (!me) return;
+  const wx = (e.clientX - view.ox) / view.scale;
+  const wy = (e.clientY - view.oy) / view.scale;
+  ws.send(JSON.stringify({ t: 'cast', dx: wx - me.x, dy: wy - me.y }));
+  const meNow = latestPlayer(myId);
+  if (meNow && meNow.a && (meNow.cd || 0) === 0 && castCdEnd <= performance.now()) {
+    castCdEnd = performance.now() + CAST_COOLDOWN * 1000;
+    // predicted ghost fireball, replaced by the server's once it appears
+    const len = Math.hypot(wx - me.x, wy - me.y) || 1;
+    ghosts.push({ x: me.x, y: me.y, dx: (wx - me.x) / len, dy: (wy - me.y) / len, at: performance.now() });
+  }
+});
+
+function latestPlayer(id) {
+  const s = snaps[snaps.length - 1];
+  return s && s.players.find(p => p.id === id);
+}
+
+// my warlock's on-screen position: predicted steps lerped for smooth
+// rendering, plus the visual error offset. Shared by camera and draw.
+function myRenderPos() {
+  if (!predicted) return null;
+  let px = predicted.x, py = predicted.y;
+  if (predictedPrev) {
+    const alpha = Math.min(1, (performance.now() - lastStepAt) / (1000 / TICK_RATE));
+    px = predictedPrev.x + (predicted.x - predictedPrev.x) * alpha;
+    py = predictedPrev.y + (predicted.y - predictedPrev.y) * alpha;
+  }
+  return { x: px + errX, y: py + errY };
+}
+
+// --- interpolation ---
+function interpolated() {
+  if (snaps.length === 0) return null;
+  const renderTime = Date.now() + clockOffset - INTERP_DELAY;
+  let a = snaps[0], b = snaps[snaps.length - 1];
+  for (let i = snaps.length - 1; i >= 1; i--) {
+    if (snaps[i - 1].now <= renderTime) { a = snaps[i - 1]; b = snaps[i]; break; }
+  }
+  const span = b.now - a.now;
+  const t = span > 0 ? Math.min(1, Math.max(0, (renderTime - a.now) / span)) : 1;
+
+  const players = b.players.map(pb => {
+    const pa = a.players.find(p => p.id === pb.id) || pb;
+    return { ...pb, x: pa.x + (pb.x - pa.x) * t, y: pa.y + (pb.y - pa.y) * t };
+  });
+  // Fireballs fly in straight lines at constant speed, so position them
+  // analytically at renderTime — same timeline as players, smooth at any fps.
+  const fireballs = b.fireballs.map(fb => {
+    const dt = (renderTime - b.now) / 1000;
+    return { id: fb.id, o: fb.o, x: fb.x + fb.dx * FIREBALL_SPEED * dt, y: fb.y + fb.dy * FIREBALL_SPEED * dt };
+  });
+  const round = { ...b.round, arenaR: a.round.arenaR + (b.round.arenaR - a.round.arenaR) * t };
+  return { players, fireballs, round, renderTime };
+}
+
+// --- rendering ---
+function resize() { canvas.width = innerWidth; canvas.height = innerHeight; }
+addEventListener('resize', resize); resize();
+
+function draw() {
+  requestAnimationFrame(draw);
+  ctx.setTransform(1, 0, 0, 1, 0, 0); // never inherit a stale transform
+  ctx.fillStyle = '#0b0b12';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const state = interpolated();
+  if (!state) return;
+
+  const nowMs = performance.now();
+  const dtFrame = Math.min(0.1, (nowMs - lastFrameAt) / 1000);
+  lastFrameAt = nowMs;
+
+  // camera: follow my warlock, smoothed, clamped to the world edges
+  const meSnap = state.players.find(p => p.id === myId);
+  const target = myRenderPos() || meSnap || cam || center;
+  if (!cam) cam = { x: target.x, y: target.y };
+  const camK = 1 - Math.exp(-8 * dtFrame);
+  cam.x += (target.x - cam.x) * camK;
+  cam.y += (target.y - cam.y) * camK;
+
+  view.scale = Math.min(canvas.width, canvas.height) / VIEW_WORLD;
+  const halfW = canvas.width / 2 / view.scale;
+  const halfH = canvas.height / 2 / view.scale;
+  const cx = halfW * 2 >= world ? world / 2 : Math.min(world - halfW, Math.max(halfW, cam.x));
+  const cy = halfH * 2 >= world ? world / 2 : Math.min(world - halfH, Math.max(halfH, cam.y));
+  view.ox = canvas.width / 2 - cx * view.scale;
+  view.oy = canvas.height / 2 - cy * view.scale;
+  ctx.save();
+  ctx.translate(view.ox, view.oy);
+  ctx.scale(view.scale, view.scale);
+
+  // lava field
+  ctx.fillStyle = '#7a1f0f';
+  ctx.fillRect(0, 0, world, world);
+  const bubble = Math.sin(performance.now() / 400) * 3;
+  // safe ground
+  ctx.beginPath();
+  ctx.arc(center.x, center.y, state.round.arenaR, 0, Math.PI * 2);
+  ctx.fillStyle = '#3d3a33';
+  ctx.fill();
+  ctx.lineWidth = 6;
+  ctx.strokeStyle = '#ff5a1f';
+  ctx.beginPath();
+  ctx.arc(center.x, center.y, state.round.arenaR + bubble, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // pillars
+  for (const pl of pillars) {
+    const s = pl.half * 2;
+    ctx.fillStyle = '#59544a';
+    ctx.fillRect(pl.x - pl.half, pl.y - pl.half, s, s);
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = '#2e2b26';
+    ctx.strokeRect(pl.x - pl.half, pl.y - pl.half, s, s);
+    ctx.fillStyle = 'rgba(255,255,255,.07)';
+    ctx.fillRect(pl.x - pl.half * 0.7, pl.y - pl.half * 0.7, s * 0.45, s * 0.45);
+  }
+
+  // fireballs (server-confirmed + predicted ghosts)
+  ghosts = ghosts.filter(g => nowMs - g.at < 800); // safety net if a cast was rejected
+  const balls = [];
+  for (const f of state.fireballs) {
+    // own fireballs are drawn exclusively from their predicted trajectory;
+    // the server copy lags on the interpolation timeline and would replay
+    if (f.o !== myId && !scheduledHits.some(h => h.fid === f.id)) balls.push(f);
+  }
+  // confirmed own fireballs: detonate against pillars locally so the splash
+  // is instant instead of waiting for the server's vanish to round-trip
+  for (const [fid, g] of ghostById) {
+    const dt = (nowMs - g.at) / 1000;
+    const x = g.x + g.dx * FIREBALL_SPEED * dt, y = g.y + g.dy * FIREBALL_SPEED * dt;
+    if (pillars.some(pl => Math.abs(x - pl.x) < pl.half + fireballR && Math.abs(y - pl.y) < pl.half + fireballR)) {
+      explosions.push({ x, y, at: nowMs });
+      hitIds.add(fid); // suppress the duplicate vanish explosion later
+      ghostById.delete(fid);
+      continue;
+    }
+    balls.push({ x, y });
+  }
+  for (const g of ghosts) {
+    const dt = (nowMs - g.at) / 1000;
+    balls.push({ x: g.x + g.dx * FIREBALL_SPEED * dt, y: g.y + g.dy * FIREBALL_SPEED * dt });
+  }
+  // spectated hits: fly the ball to the impact point, detonate on arrival
+  scheduledHits = scheduledHits.filter(h => {
+    if (state.renderTime >= h.hitTime) {
+      explosions.push({ x: h.x, y: h.y, at: nowMs });
+      const m = pendingMeasures.find(pm => pm.fid === h.fid);
+      if (m) { m.boomAt = nowMs; m.knockAt = nowMs; }
+      return false;
+    }
+    const dt = (h.hitTime - state.renderTime) / 1000;
+    balls.push({ x: h.x - h.dx * FIREBALL_SPEED * dt, y: h.y - h.dy * FIREBALL_SPEED * dt });
+    return true;
+  });
+  for (const f of balls) {
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, fireballR + 3, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,120,0,.35)';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, fireballR, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffb020';
+    ctx.fill();
+  }
+
+  // impact explosions
+  explosions = explosions.filter(e => nowMs - e.at < 280);
+  for (const e of explosions) {
+    const age = (nowMs - e.at) / 280;
+    ctx.globalAlpha = 1 - age;
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, 10 + age * 26, 0, Math.PI * 2);
+    ctx.fillStyle = '#ff8030';
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // decay visual correction error (framerate-independent)
+  const errDecay = Math.exp(-8 * dtFrame);
+  errX *= errDecay; errY *= errDecay;
+  if (dtFrame > 0) fpsEma = fpsEma * 0.95 + (1 / dtFrame) * 0.05;
+  maxErrMag = Math.max(maxErrMag, Math.hypot(errX, errY));
+
+  knocks = knocks.filter(k => (state.renderTime - k.hitTime) / 1000 < 1.5);
+
+  // players
+  for (let p of state.players) {
+    const mine = p.id === myId;
+    // early knockback from our own hits: show the impulse displacement now,
+    // minus the part interpolation already includes, so it blends to zero
+    for (const k of knocks) {
+      if (k.v !== p.id) continue;
+      const ev = (nowMs - k.visStart) / 1000;
+      const er = Math.max(0, (state.renderTime - k.hitTime) / 1000);
+      const d = ((1 - Math.exp(-FRICTION * ev)) - (1 - Math.exp(-FRICTION * er))) / FRICTION;
+      p = { ...p, x: p.x + k.kvx * d, y: p.y + k.kvy * d };
+    }
+    if (mine && p.a) {
+      const rp = myRenderPos();
+      if (rp) p = { ...p, x: rp.x, y: rp.y };
+    }
+    ctx.globalAlpha = p.a ? 1 : 0.25;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, playerR, 0, Math.PI * 2);
+    ctx.fillStyle = mine ? '#4fc3f7' : '#b388ff';
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#000';
+    ctx.stroke();
+
+    // hp bar
+    if (p.a) {
+      ctx.fillStyle = '#222';
+      ctx.fillRect(p.x - 20, p.y - playerR - 14, 40, 6);
+      ctx.fillStyle = p.hp > 40 ? '#5be35b' : '#e3c15b';
+      ctx.fillRect(p.x - 20, p.y - playerR - 14, 40 * p.hp / 100, 6);
+    }
+    ctx.fillStyle = '#fff';
+    ctx.font = '13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${p.n} (${p.w})`, p.x, p.y - playerR - 18);
+    ctx.globalAlpha = 1;
+  }
+
+  // finalize hit measurements once effects have had time to render
+  pendingMeasures = pendingMeasures.filter(m => {
+    if (nowMs - m.procAt < 1500) return true;
+    if (m.contactAt === null) { noContact++; return false; }
+    if (m.knockAt === null) noKnock++;
+    const arr = hitSamples[m.role];
+    arr.push({
+      boom: m.boomAt === null ? null : Math.round(m.boomAt - m.contactAt),
+      knock: m.knockAt === null ? null : Math.round(m.knockAt - m.contactAt)
+    });
+    if (arr.length > 60) arr.shift();
+    return false;
+  });
+
+  ctx.restore();
+
+  drawCooldownHud(state);
+
+  // status text
+  const r = state.round;
+  if (r.state === 'countdown') statusEl.textContent = `Round starts in ${Math.ceil(r.timer)}...`;
+  else if (r.state === 'ended') statusEl.textContent = r.winner ? `${r.winner} wins the round!` : 'Round over';
+  else if (r.state === 'lobby') statusEl.textContent = 'Waiting for players...';
+  else {
+    const me = state.players.find(p => p.id === myId);
+    statusEl.textContent = me && !me.a ? 'You died — spectating' : '';
+  }
+}
+function drawCooldownHud(state) {
+  const me = state.players.find(p => p.id === myId);
+  if (!me || !me.a) return;
+
+  const fbRemain = Math.max(me.cd || 0, (castCdEnd - performance.now()) / 1000, 0);
+  const dashRemain = predicted ? (predicted.dashCd || 0) : (me.dcd || 0);
+
+  const slots = [
+    { label: 'LMB', name: 'Fireball', remain: fbRemain, total: CAST_COOLDOWN },
+    { label: 'SPACE', name: 'Dash', remain: dashRemain, total: DASH_COOLDOWN }
+  ];
+
+  const size = 56, gap = 14;
+  const totalW = slots.length * size + (slots.length - 1) * gap;
+  let x = (canvas.width - totalW) / 2;
+  const y = canvas.height - size - 18;
+
+  for (const s of slots) {
+    ctx.fillStyle = 'rgba(20,20,30,.85)';
+    ctx.fillRect(x, y, size, size);
+
+    // icon
+    if (s.name === 'Fireball') {
+      ctx.beginPath();
+      ctx.arc(x + size / 2, y + size / 2, 13, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffb020';
+      ctx.fill();
+    } else {
+      ctx.strokeStyle = '#4fc3f7';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(x + 14, y + size - 18);
+      ctx.lineTo(x + size - 20, y + 20);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x + size - 20, y + 20);
+      ctx.lineTo(x + size - 28, y + 22);
+      ctx.moveTo(x + size - 20, y + 20);
+      ctx.lineTo(x + size - 22, y + 28);
+      ctx.stroke();
+    }
+
+    // cooldown overlay sweeping down as it recovers
+    if (s.remain > 0) {
+      const frac = Math.min(1, s.remain / s.total);
+      ctx.fillStyle = 'rgba(0,0,0,.65)';
+      ctx.fillRect(x, y, size, size * frac);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 16px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(s.remain.toFixed(1), x + size / 2, y + size / 2 + 6);
+    }
+
+    ctx.strokeStyle = s.remain > 0 ? '#555' : '#ffd54f';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x, y, size, size);
+
+    ctx.fillStyle = '#bbb';
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(s.label, x + size / 2, y + size + 13);
+
+    x += size + gap;
+  }
+}
+draw();
+</script>
+</body>
+</html>
