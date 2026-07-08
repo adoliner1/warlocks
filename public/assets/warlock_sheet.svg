@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="192" height="48" viewBox="0 0 192 48">
+  <!-- 4-frame walk sheet, each 48x48, faces +Y. frame 0 = idle -->
+
+  <g id="f0" transform="translate(0,0)">
+    <rect x="20" y="8" width="8" height="4" fill="#1a1028"/>
+    <rect x="18" y="12" width="12" height="4" fill="#2a1840"/>
+    <rect x="16" y="16" width="16" height="6" fill="#3d2460"/>
+    <rect x="14" y="22" width="20" height="8" fill="#4a2d72"/>
+    <rect x="12" y="30" width="24" height="10" fill="#3d2460"/>
+    <rect x="14" y="40" width="8" height="4" fill="#2a1840"/>
+    <rect x="26" y="40" width="8" height="4" fill="#2a1840"/>
+    <rect x="20" y="18" width="8" height="6" fill="#120a1c"/>
+    <rect x="16" y="24" width="4" height="4" fill="#6b42a0"/>
+    <rect x="28" y="24" width="4" height="4" fill="#6b42a0"/>
+    <rect x="30" y="14" width="3" height="10" fill="#5a4030"/>
+    <rect x="28" y="12" width="7" height="3" fill="#806040"/>
+  </g>
+
+  <g id="f1" transform="translate(48,0)">
+    <rect x="20" y="8" width="8" height="4" fill="#1a1028"/>
+    <rect x="18" y="12" width="12" height="4" fill="#2a1840"/>
+    <rect x="15" y="16" width="17" height="6" fill="#3d2460"/>
+    <rect x="13" y="22" width="21" height="8" fill="#4a2d72"/>
+    <rect x="11" y="30" width="25" height="10" fill="#3d2460"/>
+    <rect x="10" y="36" width="9" height="5" fill="#2a1840"/>
+    <rect x="28" y="41" width="8" height="4" fill="#2a1840"/>
+    <rect x="20" y="18" width="8" height="6" fill="#120a1c"/>
+    <rect x="15" y="24" width="4" height="4" fill="#6b42a0"/>
+    <rect x="29" y="24" width="4" height="4" fill="#6b42a0"/>
+    <rect x="30" y="14" width="3" height="10" fill="#5a4030"/>
+    <rect x="28" y="12" width="7" height="3" fill="#806040"/>
+  </g>
+
+  <g id="f2" transform="translate(96,0)">
+    <rect x="20" y="8" width="8" height="4" fill="#1a1028"/>
+    <rect x="18" y="12" width="12" height="4" fill="#2a1840"/>
+    <rect x="16" y="16" width="16" height="6" fill="#3d2460"/>
+    <rect x="14" y="22" width="20" height="8" fill="#4a2d72"/>
+    <rect x="13" y="30" width="22" height="9" fill="#3d2460"/>
+    <rect x="17" y="41" width="6" height="3" fill="#2a1840"/>
+    <rect x="25" y="41" width="6" height="3" fill="#2a1840"/>
+    <rect x="20" y="18" width="8" height="6" fill="#120a1c"/>
+    <rect x="16" y="24" width="4" height="4" fill="#6b42a0"/>
+    <rect x="28" y="24" width="4" height="4" fill="#6b42a0"/>
+    <rect x="30" y="14" width="3" height="10" fill="#5a4030"/>
+    <rect x="28" y="12" width="7" height="3" fill="#806040"/>
+  </g>
+
+  <g id="f3" transform="translate(144,0)">
+    <rect x="20" y="8" width="8" height="4" fill="#1a1028"/>
+    <rect x="18" y="12" width="12" height="4" fill="#2a1840"/>
+    <rect x="16" y="16" width="16" height="6" fill="#3d2460"/>
+    <rect x="14" y="22" width="20" height="8" fill="#4a2d72"/>
+    <rect x="12" y="30" width="24" height="10" fill="#3d2460"/>
+    <rect x="10" y="41" width="8" height="4" fill="#2a1840"/>
+    <rect x="29" y="36" width="9" height="5" fill="#2a1840"/>
+    <rect x="20" y="18" width="8" height="6" fill="#120a1c"/>
+    <rect x="15" y="24" width="4" height="4" fill="#6b42a0"/>
+    <rect x="29" y="24" width="4" height="4" fill="#6b42a0"/>
+    <rect x="30" y="14" width="3" height="10" fill="#5a4030"/>
+    <rect x="28" y="12" width="7" height="3" fill="#806040"/>
+  </g>
+</svg>

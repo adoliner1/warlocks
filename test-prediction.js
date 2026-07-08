@@ -47,6 +47,7 @@ ws.on('message', (raw) => {
     PILLAR_BOUNCE = t.pillarBounce; PILLAR_SLIDE = t.pillarSlide;
     return;
   }
+  if (m.t === 'arena') { PILLARS = m.pillars || []; return; }
   if (m.t !== 's') return;
   const me = m.players.find(p => p.id === myId);
   if (!me) return;

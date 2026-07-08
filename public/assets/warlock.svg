@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <!-- top-down warlock, faces +Y (up). pixel-style blocks -->
+  <rect x="20" y="8" width="8" height="4" fill="#1a1028"/>
+  <rect x="18" y="12" width="12" height="4" fill="#2a1840"/>
+  <rect x="16" y="16" width="16" height="6" fill="#3d2460"/>
+  <rect x="14" y="22" width="20" height="8" fill="#4a2d72"/>
+  <rect x="12" y="30" width="24" height="10" fill="#3d2460"/>
+  <rect x="14" y="40" width="8" height="4" fill="#2a1840"/>
+  <rect x="26" y="40" width="8" height="4" fill="#2a1840"/>
+  <!-- hood opening / face shadow -->
+  <rect x="20" y="18" width="8" height="6" fill="#120a1c"/>
+  <!-- shoulders / robe highlight -->
+  <rect x="16" y="24" width="4" height="4" fill="#6b42a0"/>
+  <rect x="28" y="24" width="4" height="4" fill="#6b42a0"/>
+  <!-- staff nub top-right when facing up -->
+  <rect x="30" y="14" width="3" height="10" fill="#5a4030"/>
+  <rect x="28" y="12" width="7" height="3" fill="#806040"/>
+</svg>

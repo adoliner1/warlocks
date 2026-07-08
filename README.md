@@ -10,18 +10,29 @@ npm install
 npm start
 ```
 
+Spawns 2 bots automatically. Set `BOT_COUNT=0` or `SPAWN_BOTS=0` to disable.
+Or run `node bot.js [count]` manually.
+
 Open http://localhost:3000 in multiple browser tabs (or from other machines on
 your LAN via http://YOUR_IP:3000) to play together.
 
 ## Controls
 
 - WASD / arrow keys: move
-- Click: cast fireball toward cursor (0.6s cooldown)
+- Hold LMB: charge fireball toward cursor (up to 1.5s), release to cast
+  — longer charge = faster fireball, but slows your walking while charging
+- RMB: lightning strike at cursor — bolt is visual only, small hitbox at the click point
 
 ## Rules
 
 - The arena shrinks over time; standing in lava burns you.
-- Stone pillars block both players and fireballs — use them as cover.
+- The arena layout is randomly generated each round: a walled plaza around
+  the center, corridor arcs, big and small rooms, plus scattered walls and
+  pillars — with plenty of open walkways exposed to the lava.
+- Walls and pillars block players, fireballs, and line of sight.
+- Fog of war: you only see within your vision radius and line of sight
+  (per-player for now; team-shared vision planned). The server filters
+  snapshots, so hidden enemies are never sent to your client.
 - Fireballs deal damage and knock you back. Knockback grows with the damage
   you've taken, so wounded warlocks fly further.
 - Last warlock standing wins the round. Rounds restart automatically.

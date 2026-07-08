@@ -26,7 +26,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="hud">WASD move &middot; click to cast fireball &middot; space to dash &middot; T for tuning</div>
+<div id="hud">WASD move &middot; hold LMB fireball &middot; RMB lightning &middot; F deflect &middot; hold Z shield &middot; E turret &middot; G dummy &middot; space dash &middot; R restart &middot; T tuning</div>
 <div id="status"></div>
 <div id="tuning"></div>
 <script>
@@ -37,6 +37,68 @@ const statusEl = document.getElementById('status');
 let myId = null;
 let world = 1600, center = { x: 800, y: 800 }, playerR = 16, fireballR = 9;
 let pillars = [];
+let VISION_R = 650;
+const fogCanvas = document.createElement('canvas');
+const fctx = fogCanvas.getContext('2d');
+const assets = { warlock: null, ready: false };
+const SPRITE_W = 48, SPRITE_H = 48, WALK_FRAMES = 4;
+
+async function loadImage(src) {
+  const img = new Image();
+  img.src = src;
+  await img.decode();
+  return img;
+}
+loadImage('assets/warlock_sheet.svg').then(img => {
+  assets.warlock = img;
+  assets.ready = true;
+}).catch(() => loadImage('assets/warlock.svg').then(img => {
+  assets.warlock = img;
+  assets.ready = true;
+})).catch(err => console.warn('Sprite load failed, using circle fallback:', err));
+
+function playerFacing() {
+  return -Math.PI / 2;
+}
+
+function playerAnimFrame(p, mine) {
+  const snap = snaps[snaps.length - 1];
+  const raw = snap && snap.players.find(pl => pl.id === p.id);
+  const vx = raw?.vx ?? 0, vy = raw?.vy ?? 0;
+  const speed = Math.hypot(vx, vy);
+  let moving = speed > 28;
+  if (mine && (keys.up || keys.down || keys.left || keys.right) && !chargeHeld) moving = true;
+  if (!moving) return 0;
+  const interval = Math.max(75, 130 - speed * 0.12);
+  return Math.floor(performance.now() / interval) % WALK_FRAMES;
+}
+
+function drawWarlock(x, y, angle, frame, mine, alpha) {
+  const img = assets.warlock;
+  const size = playerR * 2.9;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(x, y);
+  if (img) {
+    ctx.rotate(angle + Math.PI / 2);
+    ctx.imageSmoothingEnabled = false;
+    const sheet = img.width >= SPRITE_W * WALK_FRAMES;
+    if (sheet) {
+      ctx.drawImage(img, frame * SPRITE_W, 0, SPRITE_W, SPRITE_H, -size / 2, -size / 2, size, size);
+    } else {
+      ctx.drawImage(img, -size / 2, -size / 2, size, size);
+    }
+  } else {
+    ctx.beginPath();
+    ctx.arc(0, 0, playerR, 0, Math.PI * 2);
+    ctx.fillStyle = mine ? '#4fc3f7' : '#b388ff';
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#000';
+    ctx.stroke();
+  }
+  ctx.restore();
+}
 
 // snapshot buffer for interpolation (render ~70ms in the past)
 const INTERP_DELAY = 70;
@@ -53,7 +115,32 @@ ws.onmessage = (e) => {
     world = msg.world; center = msg.center;
     playerR = msg.playerR; fireballR = msg.fireballR;
     pillars = msg.pillars || [];
+    if (msg.visionR) VISION_R = msg.visionR;
     applyTuning(msg.tuning);
+    if (msg.lightning) LIGHTNING_CD = msg.lightning.cd;
+    if (msg.deflect) {
+      DEFLECT_CD = msg.deflect.cd;
+      DEFLECT_DURATION = msg.deflect.dur;
+      DEFLECT_ARC = msg.deflect.arc;
+      DEFLECT_REACH = msg.deflect.reach;
+    }
+    if (msg.turret) {
+      TURRET_CD = msg.turret.cd;
+      TURRET_INTERVAL = msg.turret.interval;
+      TURRET_MAX = msg.turret.max;
+      TURRET_R = msg.turret.r;
+    }
+    if (msg.dummy) {
+      DUMMY_CD = msg.dummy.cd;
+      DUMMY_MAX = msg.dummy.max;
+      DUMMY_HP = msg.dummy.hp;
+      DUMMY_R = msg.dummy.r;
+    }
+    if (msg.shield) {
+      SHIELD_ARC = msg.shield.arc;
+      SHIELD_LOCK = msg.shield.lock;
+      SHIELD_KB_MULT = msg.shield.kb;
+    }
   } else if (msg.t === 's') {
     msg.recv = performance.now();
     // smooth the offset so network jitter doesn't wobble the interpolation clock
@@ -67,20 +154,30 @@ ws.onmessage = (e) => {
     const liveIds = new Set();
     for (const f of msg.fireballs) {
       liveIds.add(f.id);
+      const g = ghostById.get(f.id);
+      if (g && f.o !== myId) ghostById.delete(f.id);
       if (f.o === myId && !seenMyFireballs.has(f.id)) {
         seenMyFireballs.add(f.id);
         const g = ghosts.shift();
-        if (g) ghostById.set(f.id, g);
+        // ghost already detonated on a wall locally: don't resurrect it,
+        // and swallow the explosion when the server ball vanishes
+        if (g && g.dead) hitIds.add(f.id);
+        else if (g) ghostById.set(f.id, g);
       }
     }
     for (const h of (msg.hits || [])) {
       hitIds.add(h.fid);
-      const role = h.o === myId ? 'shoot' : (h.v === myId ? 'self' : 'spec');
+      if (h.d) {
+        ghostById.delete(h.fid);
+        explosions.push({ x: h.x, y: h.y, at: performance.now() });
+        continue;
+      }
+      const role = h.v === myId ? 'self' : (h.o === myId ? 'shoot' : 'spec');
       const m = { fid: h.fid, role, procAt: performance.now(), contactAt: null, boomAt: null, knockAt: null };
       if (role === 'shoot') {
         // own ball renders in real time along the ghost trajectory
         const g = ghostById.get(h.fid) || ghosts[0];
-        if (g) m.contactAt = g.at + Math.hypot(h.x - g.x, h.y - g.y) / FIREBALL_SPEED * 1000;
+        if (g) m.contactAt = g.at + Math.hypot(h.x - g.x, h.y - g.y) / fireballSpeedAt(g.spd) * 1000;
       } else {
         // other balls render on the interp timeline: they cross the impact
         // point exactly when the render clock reaches the hit time
@@ -96,15 +193,17 @@ ws.onmessage = (e) => {
         ghostById.delete(h.fid);
         explosions.push({ x: h.x, y: h.y, at: performance.now() });
         m.boomAt = performance.now();
-        m.knockAt = role === 'shoot' ? m.boomAt
-          : (performance.now() - lastJoltAt < 150 ? lastJoltAt : null);
-        if (h.v !== myId) {
-          knocks.push({ v: h.v, kvx: h.dx * h.kb, kvy: h.dy * h.kb, hitTime: msg.now, visStart: performance.now() });
-        }
+        m.knockAt = role === 'self' ? (performance.now() - lastJoltAt < 150 ? lastJoltAt : performance.now())
+          : (role === 'shoot' ? m.boomAt : (performance.now() - lastJoltAt < 150 ? lastJoltAt : null));
+        knocks.push({ v: h.v, kvx: h.dx * h.kb, kvy: h.dy * h.kb, hitTime: msg.now, visStart: performance.now() });
+        if (h.v === myId) { jolts++; lastJoltAt = performance.now(); }
       } else {
         // spectated hit: both ball and victim are on the interp timeline,
         // so detonate exactly when the render clock reaches the hit
-        scheduledHits.push({ fid: h.fid, x: h.x, y: h.y, dx: h.dx, dy: h.dy, hitTime: msg.now });
+        scheduledHits.push({
+          fid: h.fid, x: h.x, y: h.y, dx: h.dx, dy: h.dy, hitTime: msg.now,
+          spd: (msg.fireballs.find(f => f.id === h.fid) || prevFireballs.find(f => f.id === h.fid) || {}).spd || 1
+        });
       }
     }
     // a fireball that vanished between snapshots hit something (or fizzled)
@@ -115,15 +214,33 @@ ws.onmessage = (e) => {
       const g = ghostById.get(f.id);
       if (g) {
         const dt = (performance.now() - g.at) / 1000;
-        ex = g.x + g.dx * FIREBALL_SPEED * dt;
-        ey = g.y + g.dy * FIREBALL_SPEED * dt;
+        ex = g.x + g.dx * fireballSpeedAt(g.spd) * dt;
+        ey = g.y + g.dy * fireballSpeedAt(g.spd) * dt;
+      }
+      // with fog of war, an enemy ball leaving our vision also vanishes from
+      // snapshots — don't fake an explosion at the fog edge
+      if (f.o !== myId) {
+        const me = predicted || latestPlayer(myId);
+        const meNow = latestPlayer(myId);
+        if (me && meNow && meNow.a && !pointVisible(me.x, me.y, ex, ey)) continue;
       }
       explosions.push({ x: ex, y: ey, at: performance.now() });
     }
     prevFireballs = msg.fireballs;
     for (const id of ghostById.keys()) if (!liveIds.has(id)) ghostById.delete(id);
     for (const id of seenMyFireballs) if (!liveIds.has(id)) seenMyFireballs.delete(id);
+    for (const bolt of (msg.bolts || [])) {
+      lightningBolts.push({ sx: bolt.sx, sy: bolt.sy, ex: bolt.ex, ey: bolt.ey, at: performance.now() });
+      if (bolt.v) {
+        knocks.push({ v: bolt.v, kvx: bolt.dx * bolt.kb, kvy: bolt.dy * bolt.kb, hitTime: msg.now, visStart: performance.now() });
+        if (bolt.v === myId) { jolts++; lastJoltAt = performance.now(); }
+      }
+    }
+    for (const b of (msg.sblocks || [])) {
+      shieldPops.push({ x: b.x, y: b.y, at: performance.now() });
+    }
   }
+  else if (msg.t === 'arena') pillars = msg.pillars || [];
   else if (msg.t === 'tuning') applyTuning(msg.tuning);
   else if (msg.t === 'pong') {
     const sample = performance.now() - msg.c;
@@ -133,19 +250,35 @@ ws.onmessage = (e) => {
 ws.onclose = () => { statusEl.textContent = 'Disconnected from server'; };
 
 // --- input ---
-const keys = { up: false, down: false, left: false, right: false };
+const keys = { up: false, down: false, left: false, right: false, shield: false };
 const keymap = { w: 'up', s: 'down', a: 'left', d: 'right',
                  ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right' };
 let dashQueued = false;
+let restartAt = 0;
 addEventListener('keydown', (e) => {
   if (e.key === ' ') { dashQueued = true; e.preventDefault(); return; }
+  if (e.key === 'f' || e.key === 'F') { castDeflect(); e.preventDefault(); return; }
+  if (e.key === 'e' || e.key === 'E') { spawnTurret(); e.preventDefault(); return; }
+  if (e.key === 'g' || e.key === 'G') { spawnDummy(); e.preventDefault(); return; }
+  if (e.key === 'z' || e.key === 'Z') { keys.shield = true; e.preventDefault(); return; }
+  if (e.key === 'r' || e.key === 'R') {
+    if (ws.readyState === 1 && performance.now() - restartAt > 800) {
+      restartAt = performance.now();
+      ws.send(JSON.stringify({ t: 'restart' }));
+    }
+    return;
+  }
   const k = keymap[e.key]; if (k) keys[k] = true;
 });
-addEventListener('keyup', (e) => { const k = keymap[e.key]; if (k) keys[k] = false; });
+addEventListener('keyup', (e) => {
+  if (e.key === 'z' || e.key === 'Z') { keys.shield = false; return; }
+  const k = keymap[e.key]; if (k) keys[k] = false;
+});
 // keyup events are lost when the tab loses focus, so release everything
 function releaseKeys() {
   for (const k in keys) keys[k] = false;
   dashQueued = false;
+  if (chargeHeld) releaseCharge();
 }
 addEventListener('blur', releaseKeys);
 document.addEventListener('visibilitychange', () => { if (document.hidden) releaseKeys(); });
@@ -157,6 +290,243 @@ let MOVE_SPEED = 190, FRICTION = 3.2;
 let PILLAR_BOUNCE = 0.3, PILLAR_SLIDE = 0.15;
 let DASH_SPEED = 700, DASH_COOLDOWN = 0, CAST_COOLDOWN = 0.6;
 let FIREBALL_SPEED = 420;
+const CHARGE_MAX = 1.5, CHARGE_MIN_SPEED = 0.5, CHARGE_MAX_SPEED = 2.0, CHARGE_WALK_MIN = 0.35;
+function chargeSpeedMult(t) {
+  const r = Math.min(1, Math.max(0, t / CHARGE_MAX));
+  return CHARGE_MIN_SPEED + (CHARGE_MAX_SPEED - CHARGE_MIN_SPEED) * r;
+}
+function chargeWalkMult(t) {
+  const r = Math.min(1, Math.max(0, t / CHARGE_MAX));
+  return 1 + (CHARGE_WALK_MIN - 1) * r;
+}
+function fireballSpeedAt(spd) { return FIREBALL_SPEED * (spd || 1); }
+
+const LIGHTNING_HIT_R = 12, LIGHTNING_CD = 1.0, LIGHTNING_BOLT_MS = 90;
+let DEFLECT_CD = 0.55, DEFLECT_DURATION = 0.16, DEFLECT_ARC = Math.PI * 0.7, DEFLECT_REACH = 52;
+let TURRET_CD = 3, TURRET_INTERVAL = 1.4, TURRET_MAX = 3, TURRET_R = 14;
+let DUMMY_CD = 1, DUMMY_MAX = 3, DUMMY_HP = 100, DUMMY_R = 16;
+let SHIELD_ARC = Math.PI * 2 / 3, SHIELD_LOCK = 0.25, SHIELD_KB_MULT = 0.4;
+function predictLightningEnd(ox, oy, tx, ty) {
+  let dx = tx - ox, dy = ty - oy;
+  const maxDist = Math.hypot(dx, dy);
+  if (maxDist < 1e-6) return { sx: ox, sy: oy, ex: ox, ey: oy };
+  dx /= maxDist; dy /= maxDist;
+  let endDist = maxDist;
+  for (const pl of pillars) {
+    const minX = pl.x - pl.half, maxX = pl.x + pl.half;
+    const minY = pl.y - pl.half, maxY = pl.y + pl.half;
+    let tmin = 0, tmax = endDist;
+    if (Math.abs(dx) < 1e-9) { if (ox < minX || ox > maxX) continue; }
+    else {
+      const t1 = (minX - ox) / dx, t2 = (maxX - ox) / dx;
+      tmin = Math.max(tmin, Math.min(t1, t2));
+      tmax = Math.min(tmax, Math.max(t1, t2));
+    }
+    if (Math.abs(dy) < 1e-9) { if (oy < minY || oy > maxY) continue; }
+    else {
+      const t1 = (minY - oy) / dy, t2 = (maxY - oy) / dy;
+      tmin = Math.max(tmin, Math.min(t1, t2));
+      tmax = Math.min(tmax, Math.max(t1, t2));
+    }
+    if (tmin > tmax || tmax < 0) continue;
+    const hit = tmin >= 0 ? tmin : tmax;
+    if (hit <= endDist) endDist = hit;
+  }
+  return { sx: ox, sy: oy, ex: ox + dx * endDist, ey: oy + dy * endDist };
+}
+function drawFireball(x, y, dx, dy, spd, t) {
+  const angle = Math.atan2(dy, dx);
+  const chargeScale = 1 + (spd ? (spd - 1) * 0.3 : 0);
+  const r = fireballR * chargeScale;
+  const pulse = 1 + Math.sin(t / 45) * 0.06;
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+
+  // tail — stacked along flight axis, no lateral offset
+  ctx.globalAlpha = 0.3;
+  ctx.fillStyle = '#ff3300';
+  ctx.beginPath();
+  ctx.ellipse(-r * 1.0, 0, r * 1.2 * pulse, r * 0.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 0.45;
+  ctx.fillStyle = '#ff6620';
+  ctx.beginPath();
+  ctx.ellipse(-r * 0.5, 0, r * 0.8, r * 0.38, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // main body
+  const cx = r * 0.12;
+  const grad = ctx.createRadialGradient(cx, 0, 0, cx, 0, r * 1.15);
+  grad.addColorStop(0, '#fffce0');
+  grad.addColorStop(0.35, '#ffd040');
+  grad.addColorStop(0.7, '#ff6010');
+  grad.addColorStop(1, 'rgba(200,30,0,0)');
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.ellipse(cx, 0, r * 1.15, r * 0.72, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = '#fff';
+  ctx.globalAlpha = 0.9;
+  ctx.beginPath();
+  ctx.ellipse(r * 0.2, 0, r * 0.32, r * 0.26, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function staffTipWorld(x, y, angle) {
+  const size = playerR * 2.9;
+  const scale = size / SPRITE_W;
+  const ox = 7 * scale, oy = -12 * scale;
+  const a = angle + Math.PI / 2;
+  return {
+    x: x + ox * Math.cos(a) - oy * Math.sin(a),
+    y: y + ox * Math.sin(a) + oy * Math.cos(a)
+  };
+}
+
+function drawStaffCharge(x, y, angle, chargeFrac, aimDx, aimDy, t) {
+  const tip = staffTipWorld(x, y, angle);
+  const len = Math.hypot(aimDx, aimDy) || 1;
+  const s = 0.12 + chargeFrac * 0.45;
+  ctx.save();
+  ctx.translate(tip.x, tip.y);
+  ctx.scale(s, s);
+  drawFireball(0, 0, aimDx / len, aimDy / len, chargeSpeedMult(chargeFrac * CHARGE_MAX), t);
+  ctx.restore();
+}
+function drawLightningBolt(x1, y1, x2, y2, alpha) {
+  const segs = 8;
+  const pts = [{ x: x1, y: y1 }];
+  const px = -(y2 - y1), py = (x2 - x1), plen = Math.hypot(px, py) || 1;
+  for (let i = 1; i < segs; i++) {
+    const t = i / segs;
+    const mx = x1 + (x2 - x1) * t, my = y1 + (y2 - y1) * t;
+    const jitter = (Math.random() - 0.5) * 22 * (1 - Math.abs(t - 0.5) * 1.6);
+    pts.push({ x: mx + px / plen * jitter, y: my + py / plen * jitter });
+  }
+  pts.push({ x: x2, y: y2 });
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = '#e8f4ff';
+  ctx.lineWidth = 3;
+  ctx.shadowColor = '#80d4ff';
+  ctx.shadowBlur = 12;
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+  ctx.stroke();
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 1.2;
+  ctx.shadowBlur = 0;
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function drawDeflectSwing(x, y, angle, alpha) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = '#7dd3fc';
+  ctx.lineWidth = 3;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.arc(0, 0, playerR + 26, -DEFLECT_ARC / 2, DEFLECT_ARC / 2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawShield(x, y, angle, locked) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+  ctx.globalAlpha = locked ? 0.55 : 0.4;
+  ctx.fillStyle = locked ? '#9ad4ff' : '#6eb6ff';
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.arc(0, 0, playerR + 22, -SHIELD_ARC / 2, SHIELD_ARC / 2);
+  ctx.closePath();
+  ctx.fill();
+  ctx.globalAlpha = locked ? 0.95 : 0.75;
+  ctx.strokeStyle = '#e8f4ff';
+  ctx.lineWidth = locked ? 3 : 2;
+  ctx.beginPath();
+  ctx.arc(0, 0, playerR + 22, -SHIELD_ARC / 2, SHIELD_ARC / 2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function applyShield(p, k) {
+  const locked = (p.shieldLock || 0) > 0;
+  const active = !!k.shield || locked;
+  if (active) {
+    const cl = Math.hypot(k.sdx, k.sdy);
+    if (cl > 0) p.shieldAngle = Math.atan2(k.sdy / cl, k.sdx / cl);
+    p.shieldUp = true;
+  } else {
+    p.shieldUp = false;
+  }
+}
+
+function drawTurret(t, mine, pulse) {
+  ctx.save();
+  ctx.translate(t.x, t.y);
+  ctx.rotate(t.a || 0);
+  const r = TURRET_R;
+  ctx.fillStyle = mine ? '#2a4858' : '#3a3048';
+  ctx.strokeStyle = mine ? '#4fc3f7' : '#b388ff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = pulse > 0.5 ? '#ffd54f' : '#ffb020';
+  ctx.beginPath();
+  ctx.arc(r * 0.55, 0, r * 0.35 * (0.85 + pulse * 0.15), 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#222';
+  ctx.beginPath();
+  ctx.arc(0, 0, r * 0.35, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawDummy(d, mine) {
+  const r = DUMMY_R;
+  ctx.save();
+  ctx.globalAlpha = d.a ? 1 : 0.35;
+  ctx.translate(d.x, d.y);
+  ctx.fillStyle = mine ? '#5a3030' : '#4a2840';
+  ctx.strokeStyle = mine ? '#ff8a65' : '#ce93d8';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.strokeStyle = '#ffab91';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(0, 0, r * 0.55, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.fillStyle = '#ffccbc';
+  ctx.beginPath();
+  ctx.arc(0, 0, r * 0.2, 0, Math.PI * 2);
+  ctx.fill();
+  if (d.a) {
+    ctx.fillStyle = '#222';
+    ctx.fillRect(-18, -r - 12, 36, 5);
+    ctx.fillStyle = d.hp > 40 ? '#5be35b' : '#e3c15b';
+    ctx.fillRect(-18, -r - 12, 36 * d.hp / DUMMY_HP, 5);
+  }
+  ctx.fillStyle = '#ddd';
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(d.a ? 'Dummy' : '...', 0, -r - 16);
+  ctx.restore();
+}
 
 const TUNABLES = [
   ['moveSpeed', 'Move speed', 50, 500, 5],
@@ -164,7 +534,7 @@ const TUNABLES = [
   ['dashSpeed', 'Dash speed', 0, 1500, 10],
   ['dashCooldown', 'Dash cooldown (s)', 0, 10, 0.1],
   ['castCooldown', 'Cast cooldown (s)', 0.05, 3, 0.05],
-  ['fireballSpeed', 'Fireball speed', 100, 1200, 10],
+  ['fireballSpeed', 'Fireball speed', 100, 3000, 10],
   ['fireballDmg', 'Fireball damage', 0, 50, 1],
   ['kbBase', 'Knockback base', 0, 800, 10],
   ['kbPerDmg', 'Knockback per dmg', 0, 20, 0.5],
@@ -204,20 +574,23 @@ addEventListener('keydown', (e) => {
 
 function stepPlayer(p, k, dt) {
   let mx = 0, my = 0;
-  if (k.up) my -= 1;
-  if (k.down) my += 1;
-  if (k.left) mx -= 1;
-  if (k.right) mx += 1;
+  if (!p.shieldUp) {
+    if (k.up) my -= 1;
+    if (k.down) my += 1;
+    if (k.left) mx -= 1;
+    if (k.right) mx += 1;
+  }
   const len = Math.hypot(mx, my);
   if (len > 0) { mx /= len; my /= len; }
   p.dashCd = Math.max(0, (p.dashCd || 0) - dt);
-  if (k.dash && p.dashCd === 0 && len > 0) {
+  if (!p.shieldUp && k.dash && p.dashCd === 0 && len > 0) {
     p.vx += mx * DASH_SPEED;
     p.vy += my * DASH_SPEED;
     p.dashCd = DASH_COOLDOWN;
   }
-  p.x += (mx * MOVE_SPEED + p.vx) * dt;
-  p.y += (my * MOVE_SPEED + p.vy) * dt;
+  const walkMult = p.charging ? chargeWalkMult(p.chargeTime || 0) : 1;
+  p.x += (mx * MOVE_SPEED * walkMult + p.vx) * dt;
+  p.y += (my * MOVE_SPEED * walkMult + p.vy) * dt;
   const decay = Math.exp(-FRICTION * dt);
   p.vx *= decay; p.vy *= decay;
   // must match server.js exactly: axis pushout + reflected bounce
@@ -254,11 +627,30 @@ setInterval(() => {
   if (ws.readyState !== 1 || myId === null) return;
   const me = latestPlayer(myId);
   if (!me || !me.a) { predicted = null; predictedPrev = null; pending = []; return; }
-  if (!predicted) predicted = { x: me.x, y: me.y, vx: me.vx || 0, vy: me.vy || 0, dashCd: me.dcd || 0 };
+  if (!predicted) predicted = {
+    x: me.x, y: me.y, vx: me.vx || 0, vy: me.vy || 0, dashCd: me.dcd || 0,
+    charging: false, chargeTime: 0, shieldUp: false, shieldAngle: 0, shieldLock: 0
+  };
 
+  predicted.shieldLock = Math.max(0, (predicted.shieldLock || 0) - DT);
   seq++;
   const k = { ...keys, dash: dashQueued };
   dashQueued = false;
+  if (predicted) {
+    k.sdx = mouseWorld.x - predicted.x;
+    k.sdy = mouseWorld.y - predicted.y;
+    applyShield(predicted, k);
+  }
+  if (chargeHeld) {
+    k.charge = true;
+    k.cdx = chargeAim.dx;
+    k.cdy = chargeAim.dy;
+    if (!predicted.charging) { predicted.charging = true; predicted.chargeTime = 0; }
+    predicted.chargeTime = Math.min(CHARGE_MAX, predicted.chargeTime + DT);
+  } else if (predicted.charging) {
+    predicted.charging = false;
+    predicted.chargeTime = 0;
+  }
   ws.send(JSON.stringify({ t: 'input', seq, keys: k }));
   pending.push({ seq, keys: k });
   if (pending.length > 90) pending.shift();
@@ -271,8 +663,22 @@ setInterval(() => {
 function reconcile(me) {
   if (!predicted || me.seq === undefined) return;
   pending = pending.filter(i => i.seq > me.seq);
-  const auth = { x: me.x, y: me.y, vx: me.vx || 0, vy: me.vy || 0, dashCd: me.dcd || 0 };
-  for (const i of pending) stepPlayer(auth, i.keys, DT);
+  const auth = {
+    x: me.x, y: me.y, vx: me.vx || 0, vy: me.vy || 0, dashCd: me.dcd || 0,
+    charging: false, chargeTime: 0, shieldUp: !!me.shu, shieldAngle: me.sha || 0,
+    shieldLock: me.shl || 0
+  };
+  for (const i of pending) {
+    if (i.keys.charge) {
+      if (!auth.charging) { auth.charging = true; auth.chargeTime = 0; }
+      auth.chargeTime = Math.min(CHARGE_MAX, auth.chargeTime + DT);
+    } else if (auth.charging) {
+      auth.charging = false;
+      auth.chargeTime = 0;
+    }
+    applyShield(auth, i.keys);
+    stepPlayer(auth, i.keys, DT);
+  }
   const dx = predicted.x - auth.x, dy = predicted.y - auth.y;
   const dv = Math.hypot(predicted.vx - auth.vx, predicted.vy - auth.vy);
   if (Math.hypot(dx, dy) > SNAP_DIST) {
@@ -288,12 +694,20 @@ function reconcile(me) {
   }
   if (predictedPrev) { predictedPrev.x -= dx; predictedPrev.y -= dy; }
   predicted = auth;
+  if (me.chg > 0 && !chargeHeld) {
+    predicted.charging = true;
+    predicted.chargeTime = me.chg;
+  }
 }
 
 let view = { scale: 1, ox: 0, oy: 0 };
 const VIEW_WORLD = 900;          // world units visible across the shorter screen axis
 let cam = null;                  // smoothed camera center in world coords
-let castCdEnd = 0; // local prediction of fireball cooldown for the HUD
+let castCdEnd = 0;
+let lightningCdEnd = 0;
+let deflectCdEnd = 0;
+let turretCdEnd = 0;
+let dummyCdEnd = 0;
 let ghosts = [];   // locally predicted fireballs awaiting server confirmation
 const seenMyFireballs = new Set();
 const ghostById = new Map(); // confirmed fireball id -> its client-predicted trajectory
@@ -302,7 +716,10 @@ let prevFireballs = [];
 let lastFrameAt = performance.now();
 const hitIds = new Set();  // fireballs already detonated via a hit event
 let scheduledHits = [];    // hits waiting for the render clock to reach them
-let knocks = [];           // early visual knockback on remote victims
+let knocks = [];
+let lightningBolts = [];
+let shieldPops = [];
+let mouseWorld = { x: 0, y: 0 };
 
 // --- diagnostics: compact, machine-readable; server exposes them at GET /diag ---
 // Per hit we measure the gap (ms) between the rendered fireball crossing the
@@ -339,21 +756,109 @@ setInterval(() => {
   }}));
   maxErrMag = 0;
 }, 5000);
-canvas.addEventListener('mousedown', (e) => {
-  if (ws.readyState !== 1 || myId === null) return;
+let chargeHeld = false;
+let chargeAim = { dx: 1, dy: 0 };
+let chargeStartAt = 0;
+
+function aimFromEvent(e) {
   const me = predicted || latestPlayer(myId);
   if (!me) return;
   const wx = (e.clientX - view.ox) / view.scale;
   const wy = (e.clientY - view.oy) / view.scale;
-  ws.send(JSON.stringify({ t: 'cast', dx: wx - me.x, dy: wy - me.y }));
+  const dx = wx - me.x, dy = wy - me.y;
+  const len = Math.hypot(dx, dy) || 1;
+  chargeAim.dx = dx;
+  chargeAim.dy = dy;
+}
+
+function releaseCharge() {
+  if (!chargeHeld) return;
+  chargeHeld = false;
+  if (ws.readyState !== 1 || myId === null) return;
+  const me = predicted || latestPlayer(myId);
+  if (!me) return;
   const meNow = latestPlayer(myId);
-  if (meNow && meNow.a && (meNow.cd || 0) === 0 && castCdEnd <= performance.now()) {
-    castCdEnd = performance.now() + CAST_COOLDOWN * 1000;
-    // predicted ghost fireball, replaced by the server's once it appears
-    const len = Math.hypot(wx - me.x, wy - me.y) || 1;
-    ghosts.push({ x: me.x, y: me.y, dx: (wx - me.x) / len, dy: (wy - me.y) / len, at: performance.now() });
-  }
+  if (!meNow || !meNow.a || (meNow.cd || 0) > 0 || castCdEnd > performance.now()) return;
+  const charge = Math.min(CHARGE_MAX, (performance.now() - chargeStartAt) / 1000);
+  const len = Math.hypot(chargeAim.dx, chargeAim.dy) || 1;
+  const dx = chargeAim.dx / len, dy = chargeAim.dy / len;
+  const spd = chargeSpeedMult(charge);
+  ws.send(JSON.stringify({ t: 'cast', dx: chargeAim.dx, dy: chargeAim.dy, charge }));
+  castCdEnd = performance.now() + CAST_COOLDOWN * 1000;
+  const gr = fireballR * (1 + (spd - 1) * 0.3);
+  const clip = new Set(pillars.filter(pl =>
+    Math.abs(me.x - pl.x) < pl.half + gr && Math.abs(me.y - pl.y) < pl.half + gr));
+  ghosts.push({ x: me.x, y: me.y, dx, dy, spd, at: performance.now(), clip: clip.size ? clip : null });
+  if (predicted) { predicted.charging = false; predicted.chargeTime = 0; }
+}
+
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+canvas.addEventListener('mousemove', (e) => {
+  mouseWorld.x = (e.clientX - view.ox) / view.scale;
+  mouseWorld.y = (e.clientY - view.oy) / view.scale;
+  if (chargeHeld) aimFromEvent(e);
 });
+canvas.addEventListener('mousedown', (e) => {
+  if (e.button === 2) {
+    e.preventDefault();
+    castLightning(e);
+    return;
+  }
+  if (e.button !== 0 || ws.readyState !== 1 || myId === null) return;
+  const meNow = latestPlayer(myId);
+  if (!meNow || !meNow.a || (meNow.cd || 0) > 0 || castCdEnd > performance.now()) return;
+  chargeHeld = true;
+  chargeStartAt = performance.now();
+  aimFromEvent(e);
+});
+canvas.addEventListener('mouseup', (e) => { if (e.button === 0) releaseCharge(); });
+addEventListener('mouseup', (e) => { if (e.button === 0) releaseCharge(); });
+
+function castDeflect() {
+  if (ws.readyState !== 1 || myId === null) return;
+  const me = predicted || latestPlayer(myId);
+  if (!me) return;
+  const meNow = latestPlayer(myId);
+  if (!meNow || !meNow.a || (meNow.dfcd || 0) > 0 || deflectCdEnd > performance.now()) return;
+  const dx = mouseWorld.x - me.x, dy = mouseWorld.y - me.y;
+  ws.send(JSON.stringify({ t: 'deflect', dx, dy }));
+  deflectCdEnd = performance.now() + DEFLECT_CD * 1000;
+}
+
+function spawnTurret() {
+  if (ws.readyState !== 1 || myId === null) return;
+  const meNow = latestPlayer(myId);
+  if (!meNow || !meNow.a || (meNow.tcd || 0) > 0 || turretCdEnd > performance.now()) return;
+  const snap = snaps[snaps.length - 1];
+  const mine = (snap?.turrets || []).filter(t => t.o === myId).length;
+  if (mine >= TURRET_MAX) return;
+  ws.send(JSON.stringify({ t: 'turret', tx: mouseWorld.x, ty: mouseWorld.y }));
+  turretCdEnd = performance.now() + TURRET_CD * 1000;
+}
+
+function spawnDummy() {
+  if (ws.readyState !== 1 || myId === null) return;
+  const meNow = latestPlayer(myId);
+  if (!meNow || !meNow.a || (meNow.ycd || 0) > 0 || dummyCdEnd > performance.now()) return;
+  const snap = snaps[snaps.length - 1];
+  if ((snap?.dummies || []).filter(d => d.o === myId).length >= DUMMY_MAX) return;
+  ws.send(JSON.stringify({ t: 'dummy', tx: mouseWorld.x, ty: mouseWorld.y }));
+  dummyCdEnd = performance.now() + DUMMY_CD * 1000;
+}
+
+function castLightning(e) {
+  if (ws.readyState !== 1 || myId === null) return;
+  const me = predicted || latestPlayer(myId);
+  if (!me) return;
+  const meNow = latestPlayer(myId);
+  if (!meNow || !meNow.a || (meNow.lcd || 0) > 0 || lightningCdEnd > performance.now()) return;
+  const wx = (e.clientX - view.ox) / view.scale;
+  const wy = (e.clientY - view.oy) / view.scale;
+  ws.send(JSON.stringify({ t: 'lightning', tx: wx, ty: wy }));
+  lightningCdEnd = performance.now() + LIGHTNING_CD * 1000;
+  const bolt = predictLightningEnd(me.x, me.y, wx, wy);
+  lightningBolts.push({ ...bolt, at: performance.now() });
+}
 
 function latestPlayer(id) {
   const s = snaps[snaps.length - 1];
@@ -392,14 +897,106 @@ function interpolated() {
   // analytically at renderTime — same timeline as players, smooth at any fps.
   const fireballs = b.fireballs.map(fb => {
     const dt = (renderTime - b.now) / 1000;
-    return { id: fb.id, o: fb.o, x: fb.x + fb.dx * FIREBALL_SPEED * dt, y: fb.y + fb.dy * FIREBALL_SPEED * dt };
+    return { id: fb.id, o: fb.o, dx: fb.dx, dy: fb.dy,
+      x: fb.x + fb.dx * fireballSpeedAt(fb.spd) * dt, y: fb.y + fb.dy * fireballSpeedAt(fb.spd) * dt, spd: fb.spd };
   });
   const round = { ...b.round, arenaR: a.round.arenaR + (b.round.arenaR - a.round.arenaR) * t };
-  return { players, fireballs, round, renderTime };
+  const turrets = b.turrets || [];
+  const dummies = b.dummies || [];
+  return { players, fireballs, turrets, dummies, round, renderTime };
+}
+
+// --- fog of war ---
+// The server already filters entities you can't see; this draws the visual
+// half: a dark overlay with a lit polygon shadowcast from your warlock.
+const FOG_BASE_RAYS = 90;
+function rayPillarDist(ox, oy, dx, dy, maxDist, blocks) {
+  let best = maxDist;
+  for (const pl of blocks) {
+    const minX = pl.x - pl.half, maxX = pl.x + pl.half;
+    const minY = pl.y - pl.half, maxY = pl.y + pl.half;
+    let tmin = 0, tmax = best;
+    if (Math.abs(dx) < 1e-9) { if (ox < minX || ox > maxX) continue; }
+    else {
+      const t1 = (minX - ox) / dx, t2 = (maxX - ox) / dx;
+      tmin = Math.max(tmin, Math.min(t1, t2));
+      tmax = Math.min(tmax, Math.max(t1, t2));
+    }
+    if (Math.abs(dy) < 1e-9) { if (oy < minY || oy > maxY) continue; }
+    else {
+      const t1 = (minY - oy) / dy, t2 = (maxY - oy) / dy;
+      tmin = Math.max(tmin, Math.min(t1, t2));
+      tmax = Math.min(tmax, Math.max(t1, t2));
+    }
+    if (tmin > tmax || tmax < 0) continue;
+    const hit = tmin >= 0 ? tmin : tmax;
+    if (hit < best) best = hit;
+  }
+  return best;
+}
+
+function pointVisible(vx, vy, x, y) {
+  const d = Math.hypot(x - vx, y - vy);
+  if (d > VISION_R) return false;
+  if (d < 1e-6) return true;
+  return rayPillarDist(vx, vy, (x - vx) / d, (y - vy) / d, d, pillars) >= d;
+}
+
+function drawFog(px, py) {
+  const nearby = pillars.filter(pl =>
+    Math.hypot(pl.x - px, pl.y - py) < VISION_R + pl.half * 2);
+
+  // Cast rays exactly at every wall corner (plus a hair to either side, so
+  // one ray stops at the corner and the twin slips past it), and a coarse
+  // fan for the smooth vision circle in open directions. This makes shadow
+  // silhouettes track the geometry exactly instead of snapping between
+  // fixed angular steps, so the fog sweeps smoothly as you move.
+  const angles = [];
+  for (let i = 0; i < FOG_BASE_RAYS; i++) angles.push((i / FOG_BASE_RAYS) * Math.PI * 2 - Math.PI);
+  const EPS = 5e-4;
+  for (const pl of nearby) {
+    for (const [cx, cy] of [
+      [pl.x - pl.half, pl.y - pl.half], [pl.x + pl.half, pl.y - pl.half],
+      [pl.x - pl.half, pl.y + pl.half], [pl.x + pl.half, pl.y + pl.half]
+    ]) {
+      if (Math.hypot(cx - px, cy - py) > VISION_R) continue;
+      const a = Math.atan2(cy - py, cx - px);
+      angles.push(a - EPS, a, a + EPS);
+    }
+  }
+  angles.sort((a, b) => a - b);
+
+  fctx.setTransform(1, 0, 0, 1, 0, 0);
+  fctx.globalCompositeOperation = 'source-over';
+  fctx.clearRect(0, 0, fogCanvas.width, fogCanvas.height);
+  fctx.fillStyle = 'rgba(6, 6, 14, 0.88)';
+  fctx.fillRect(0, 0, fogCanvas.width, fogCanvas.height);
+  fctx.setTransform(view.scale, 0, 0, view.scale, view.ox, view.oy);
+  fctx.globalCompositeOperation = 'destination-out';
+  const grad = fctx.createRadialGradient(px, py, 0, px, py, VISION_R);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.7, 'rgba(255,255,255,1)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  fctx.fillStyle = grad;
+  fctx.beginPath();
+  let first = true;
+  for (const a of angles) {
+    const dx = Math.cos(a), dy = Math.sin(a);
+    // extend a touch past the hit so the blocking wall's face stays lit
+    const d = Math.min(VISION_R, rayPillarDist(px, py, dx, dy, VISION_R, nearby) + 24);
+    if (first) { fctx.moveTo(px + dx * d, py + dy * d); first = false; }
+    else fctx.lineTo(px + dx * d, py + dy * d);
+  }
+  fctx.closePath();
+  fctx.fill();
+  ctx.drawImage(fogCanvas, 0, 0);
 }
 
 // --- rendering ---
-function resize() { canvas.width = innerWidth; canvas.height = innerHeight; }
+function resize() {
+  canvas.width = innerWidth; canvas.height = innerHeight;
+  fogCanvas.width = innerWidth; fogCanvas.height = innerHeight;
+}
 addEventListener('resize', resize); resize();
 
 function draw() {
@@ -461,30 +1058,67 @@ function draw() {
     ctx.fillRect(pl.x - pl.half * 0.7, pl.y - pl.half * 0.7, s * 0.45, s * 0.45);
   }
 
+  const turretPulse = 0.5 + Math.sin(nowMs / (TURRET_INTERVAL * 500)) * 0.5;
+  for (const t of (state.turrets || [])) {
+    drawTurret(t, t.o === myId, turretPulse);
+  }
+  for (const d of (state.dummies || [])) {
+    drawDummy(d, d.o === myId);
+  }
+
   // fireballs (server-confirmed + predicted ghosts)
   ghosts = ghosts.filter(g => nowMs - g.at < 800); // safety net if a cast was rejected
   const balls = [];
   for (const f of state.fireballs) {
-    // own fireballs are drawn exclusively from their predicted trajectory;
-    // the server copy lags on the interpolation timeline and would replay
-    if (f.o !== myId && !scheduledHits.some(h => h.fid === f.id)) balls.push(f);
+    if (scheduledHits.some(h => h.fid === f.id)) continue;
+    // player casts use ghost trajectories; turret shots and others use server state
+    if (f.o === myId && ghostById.has(f.id)) continue;
+    balls.push(f);
   }
-  // confirmed own fireballs: detonate against pillars locally so the splash
-  // is instant instead of waiting for the server's vanish to round-trip
+  // matches server stepFireball: charge-scaled radius, and pillars overlapped
+  // at spawn don't detonate until the ball's center enters the pillar body
+  // or it flies clear of them
+  function ghostHitsPillar(g, x, y) {
+    const gr = fireballR * (1 + ((g.spd || 1) - 1) * 0.3);
+    for (const pl of pillars) {
+      const inside = Math.abs(x - pl.x) < pl.half + gr && Math.abs(y - pl.y) < pl.half + gr;
+      if (g.clip && g.clip.has(pl)) {
+        if (Math.abs(x - pl.x) < pl.half && Math.abs(y - pl.y) < pl.half) return true;
+        if (!inside) g.clip.delete(pl);
+        continue;
+      }
+      if (inside) return true;
+    }
+    return false;
+  }
+  // own fireballs (confirmed or not): detonate against pillars locally so the
+  // splash is instant instead of waiting for the server's vanish to round-trip
   for (const [fid, g] of ghostById) {
     const dt = (nowMs - g.at) / 1000;
-    const x = g.x + g.dx * FIREBALL_SPEED * dt, y = g.y + g.dy * FIREBALL_SPEED * dt;
-    if (pillars.some(pl => Math.abs(x - pl.x) < pl.half + fireballR && Math.abs(y - pl.y) < pl.half + fireballR)) {
+    const spd = fireballSpeedAt(g.spd);
+    const x = g.x + g.dx * spd * dt, y = g.y + g.dy * spd * dt;
+    if (ghostHitsPillar(g, x, y)) {
       explosions.push({ x, y, at: nowMs });
       hitIds.add(fid); // suppress the duplicate vanish explosion later
       ghostById.delete(fid);
       continue;
     }
-    balls.push({ x, y });
+    balls.push({ x, y, dx: g.dx, dy: g.dy, spd: g.spd });
   }
+  // unconfirmed ghosts: a ball that dies on the server before its first
+  // snapshot never confirms, so it must still explode on walls locally.
+  // Dead ghosts stay in the queue so FIFO pairing with confirmations holds.
   for (const g of ghosts) {
+    if (g.dead) continue;
     const dt = (nowMs - g.at) / 1000;
-    balls.push({ x: g.x + g.dx * FIREBALL_SPEED * dt, y: g.y + g.dy * FIREBALL_SPEED * dt });
+    const spd = fireballSpeedAt(g.spd);
+    const x = g.x + g.dx * spd * dt, y = g.y + g.dy * spd * dt;
+    if (ghostHitsPillar(g, x, y)) {
+      explosions.push({ x, y, at: nowMs });
+      g.dead = true;
+      continue;
+    }
+    balls.push({ x, y, dx: g.dx, dy: g.dy, spd: g.spd });
   }
   // spectated hits: fly the ball to the impact point, detonate on arrival
   scheduledHits = scheduledHits.filter(h => {
@@ -495,18 +1129,12 @@ function draw() {
       return false;
     }
     const dt = (h.hitTime - state.renderTime) / 1000;
-    balls.push({ x: h.x - h.dx * FIREBALL_SPEED * dt, y: h.y - h.dy * FIREBALL_SPEED * dt });
+    balls.push({ x: h.x - h.dx * fireballSpeedAt(h.spd) * dt, y: h.y - h.dy * fireballSpeedAt(h.spd) * dt, dx: h.dx, dy: h.dy, spd: h.spd });
     return true;
   });
   for (const f of balls) {
-    ctx.beginPath();
-    ctx.arc(f.x, f.y, fireballR + 3, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(255,120,0,.35)';
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(f.x, f.y, fireballR, 0, Math.PI * 2);
-    ctx.fillStyle = '#ffb020';
-    ctx.fill();
+    const dx = f.dx ?? 1, dy = f.dy ?? 0;
+    drawFireball(f.x, f.y, dx, dy, f.spd, nowMs);
   }
 
   // impact explosions
@@ -519,6 +1147,41 @@ function draw() {
     ctx.fillStyle = '#ff8030';
     ctx.fill();
     ctx.globalAlpha = 1;
+  }
+  shieldPops = shieldPops.filter(p => nowMs - p.at < 200);
+  for (const p of shieldPops) {
+    const age = (nowMs - p.at) / 200;
+    ctx.globalAlpha = 1 - age;
+    ctx.strokeStyle = '#b8ecff';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 8 + age * 18, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  lightningBolts = lightningBolts.filter(b => nowMs - b.at < LIGHTNING_BOLT_MS);
+  for (const b of lightningBolts) {
+    const age = (nowMs - b.at) / LIGHTNING_BOLT_MS;
+    drawLightningBolt(b.sx, b.sy, b.ex, b.ey, 1 - age);
+    if (age < 0.25) {
+      ctx.globalAlpha = (1 - age / 0.25) * 0.55;
+      ctx.beginPath();
+      ctx.arc(b.ex, b.ey, LIGHTNING_HIT_R * (0.6 + age), 0, Math.PI * 2);
+      ctx.fillStyle = '#b8ecff';
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  for (const p of state.players) {
+    if (!p.a || !(p.dft > 0)) continue;
+    let px = p.x, py = p.y;
+    if (p.id === myId) {
+      const rp = myRenderPos();
+      if (rp) { px = rp.x; py = rp.y; }
+    }
+    drawDeflectSwing(px, py, p.dfa || 0, p.dft / DEFLECT_DURATION);
   }
 
   // decay visual correction error (framerate-independent)
@@ -546,13 +1209,26 @@ function draw() {
       if (rp) p = { ...p, x: rp.x, y: rp.y };
     }
     ctx.globalAlpha = p.a ? 1 : 0.25;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, playerR, 0, Math.PI * 2);
-    ctx.fillStyle = mine ? '#4fc3f7' : '#b388ff';
-    ctx.fill();
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = '#000';
-    ctx.stroke();
+    drawWarlock(p.x, p.y, playerFacing(), playerAnimFrame(p, mine), mine, p.a ? 1 : 0.25);
+
+    const shieldOn = mine
+      ? (predicted && predicted.shieldUp) || p.shu
+      : p.shu;
+    const shieldAngle = mine && predicted && predicted.shieldUp ? predicted.shieldAngle : (p.sha || 0);
+    const shieldLocked = mine
+      ? (predicted && (predicted.shieldLock || 0) > 0) || (p.shl || 0) > 0
+      : (p.shl || 0) > 0;
+    if (shieldOn && p.a) drawShield(p.x, p.y, shieldAngle, shieldLocked);
+
+    const chg = mine
+      ? (chargeHeld ? Math.min(CHARGE_MAX, (nowMs - chargeStartAt) / 1000) : (predicted && predicted.charging ? predicted.chargeTime : 0))
+      : (p.chg || 0);
+    if (chg > 0 && p.a) {
+      const frac = chg / CHARGE_MAX;
+      const aimDx = mine && chargeHeld ? chargeAim.dx : 0;
+      const aimDy = mine && chargeHeld ? chargeAim.dy : -1;
+      drawStaffCharge(p.x, p.y, playerFacing(), frac, aimDx, aimDy, nowMs);
+    }
 
     // hp bar
     if (p.a) {
@@ -584,12 +1260,16 @@ function draw() {
 
   ctx.restore();
 
+  if (state.round.state === 'playing' && meSnap && meSnap.a) {
+    const rp = myRenderPos() || meSnap;
+    drawFog(rp.x, rp.y);
+  }
+
   drawCooldownHud(state);
 
   // status text
   const r = state.round;
-  if (r.state === 'countdown') statusEl.textContent = `Round starts in ${Math.ceil(r.timer)}...`;
-  else if (r.state === 'ended') statusEl.textContent = r.winner ? `${r.winner} wins the round!` : 'Round over';
+  if (r.state === 'ended') statusEl.textContent = r.winner ? `${r.winner} wins the round!` : 'Round over';
   else if (r.state === 'lobby') statusEl.textContent = 'Waiting for players...';
   else {
     const me = state.players.find(p => p.id === myId);
@@ -601,11 +1281,24 @@ function drawCooldownHud(state) {
   if (!me || !me.a) return;
 
   const fbRemain = Math.max(me.cd || 0, (castCdEnd - performance.now()) / 1000, 0);
+  const ltRemain = Math.max(me.lcd || 0, (lightningCdEnd - performance.now()) / 1000, 0);
+  const dfRemain = Math.max(me.dfcd || 0, (deflectCdEnd - performance.now()) / 1000, 0);
+  const trRemain = Math.max(me.tcd || 0, (turretCdEnd - performance.now()) / 1000, 0);
+  const dmRemain = Math.max(me.ycd || 0, (dummyCdEnd - performance.now()) / 1000, 0);
   const dashRemain = predicted ? (predicted.dashCd || 0) : (me.dcd || 0);
+  const chgFrac = chargeHeld ? Math.min(1, (performance.now() - chargeStartAt) / 1000 / CHARGE_MAX) : 0;
+  const snap = snaps[snaps.length - 1];
+  const turretCount = (snap?.turrets || []).filter(t => t.o === myId).length;
+  const dummyCount = (snap?.dummies || []).filter(d => d.o === myId).length;
 
   const slots = [
-    { label: 'LMB', name: 'Fireball', remain: fbRemain, total: CAST_COOLDOWN },
-    { label: 'SPACE', name: 'Dash', remain: dashRemain, total: DASH_COOLDOWN }
+    { label: 'LMB', name: 'Fireball', remain: fbRemain, total: CAST_COOLDOWN, charge: chgFrac },
+    { label: 'RMB', name: 'Lightning', remain: ltRemain, total: LIGHTNING_CD },
+    { label: 'F', name: 'Deflect', remain: dfRemain, total: DEFLECT_CD },
+    { label: 'E', name: 'Turret', remain: trRemain, total: TURRET_CD, count: turretCount, max: TURRET_MAX },
+    { label: 'G', name: 'Dummy', remain: dmRemain, total: DUMMY_CD, count: dummyCount, max: DUMMY_MAX },
+    { label: 'Z', name: 'Shield', remain: 0, total: 1, held: keys.shield || (predicted && predicted.shieldUp) },
+    { label: 'SPC', name: 'Dash', remain: dashRemain, total: DASH_COOLDOWN }
   ];
 
   const size = 56, gap = 14;
@@ -620,9 +1313,78 @@ function drawCooldownHud(state) {
     // icon
     if (s.name === 'Fireball') {
       ctx.beginPath();
-      ctx.arc(x + size / 2, y + size / 2, 13, 0, Math.PI * 2);
-      ctx.fillStyle = '#ffb020';
+      ctx.arc(x + size / 2, y + size / 2, 10 + (s.charge || 0) * 5, 0, Math.PI * 2);
+      ctx.fillStyle = s.charge ? `rgb(255, ${Math.round(120 + 135 * s.charge)}, 32)` : '#ffb020';
       ctx.fill();
+    } else if (s.name === 'Lightning') {
+      ctx.strokeStyle = '#80d4ff';
+      ctx.lineWidth = 2.5;
+      ctx.shadowColor = '#80d4ff';
+      ctx.shadowBlur = 6;
+      ctx.beginPath();
+      ctx.moveTo(x + size / 2 - 8, y + 14);
+      ctx.lineTo(x + size / 2 + 2, y + size / 2);
+      ctx.lineTo(x + size / 2 - 4, y + size / 2);
+      ctx.lineTo(x + size / 2 + 8, y + size - 14);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+    } else if (s.name === 'Deflect') {
+      ctx.strokeStyle = '#4fc3f7';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(x + size / 2, y + size / 2 + 4, 14, -Math.PI * 0.55, Math.PI * 0.1);
+      ctx.stroke();
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.moveTo(x + size / 2 + 10, y + size / 2 - 6);
+      ctx.lineTo(x + size / 2 + 18, y + size / 2 + 2);
+      ctx.stroke();
+    } else if (s.name === 'Turret') {
+      ctx.fillStyle = '#2a4858';
+      ctx.strokeStyle = '#4fc3f7';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(x + size / 2, y + size / 2, 12, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#ffb020';
+      ctx.beginPath();
+      ctx.arc(x + size / 2 + 7, y + size / 2, 5, 0, Math.PI * 2);
+      ctx.fill();
+      if (s.count != null) {
+        ctx.fillStyle = '#bbb';
+        ctx.font = '10px sans-serif';
+        ctx.fillText(`${s.count}/${s.max}`, x + size / 2, y + 8);
+      }
+    } else if (s.name === 'Dummy') {
+      ctx.fillStyle = '#5a3030';
+      ctx.strokeStyle = '#ff8a65';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(x + size / 2, y + size / 2, 12, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.strokeStyle = '#ffab91';
+      ctx.beginPath();
+      ctx.arc(x + size / 2, y + size / 2, 6, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = '#ffccbc';
+      ctx.beginPath();
+      ctx.arc(x + size / 2, y + size / 2, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+      if (s.count != null) {
+        ctx.fillStyle = '#bbb';
+        ctx.font = '10px sans-serif';
+        ctx.fillText(`${s.count}/${s.max}`, x + size / 2, y + 8);
+      }
+    } else if (s.name === 'Shield') {
+      ctx.fillStyle = s.held ? '#6eb6ff' : '#3a5070';
+      ctx.strokeStyle = '#e8f4ff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(x + size / 2, y + size / 2 + 2, 14, -SHIELD_ARC / 2, SHIELD_ARC / 2);
+      ctx.fill();
+      ctx.stroke();
     } else {
       ctx.strokeStyle = '#4fc3f7';
       ctx.lineWidth = 4;
